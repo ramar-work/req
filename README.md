@@ -31,7 +31,8 @@ The following command would be equivalent to the cURL invocation above:
 At its completion, `req` will show you a nicely formatted menu.  Here's a test I ran earlier against a virtual machine.
 
 ```
-$ ./req -X -u http://arch1.local:2000 -t 128 -S -P filesTest suite will use: 7812 kb of memory
+$ ./req -X -u http://arch1.local:2000 -t 128 -S -P files
+Test suite will use: 7812 kb of memory
 Making requests to http://arch1.local:2000
 Time elapsed: ~1m15s
 REQ 0000 (0x507000000800) = Time: 47.62s, Size: 24235118b, Status: 200, Url: http://arch1.local:2000
