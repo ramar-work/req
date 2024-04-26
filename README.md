@@ -64,6 +64,14 @@ Usage: ./req
 ```
 
 
+## Building
+
+There is no (and probably never will be a) package for this.  It's incredibly and should compile on most any system that has cURL and an accompanying development library installed.
+
+The Makefile here references `clang` as the default C compiler.  Though that can be overriden via the CC environment variable.
+
+
+
 ## Why Did I Write This? 
 
 I needed something a little more reliable than `xargs` magic to get some server testing done.   It ended up being far simpler to just write a quick C program to get this done than trying to muck about that...
