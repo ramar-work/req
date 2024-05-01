@@ -21,21 +21,22 @@
 
 #define MAX_THREADCOUNT 9999
 
-#define LOGFMT "REQ %04d (%p) = Time: %0.2fs, Size: %ldb, Status: %d, Url: %s\n"
+#define LOGFMT "REQ %04d (%p) = Time: %0.2fs, Size: %ldb, Status: %d, %s\n"
 
 #define HELP \
-"-F, -file <arg>             Use file <arg> as the comparison file.\n" \
-"-S, -save                   Save the payload with a sensible suffix.\n" \
-"-P, -path <arg>             Define an alternate path to save files (default is the current directory).\n" \
-"-u, -url <arg>              Fetch URL <arg>.\n" \
-"-X, -stats                  Display statistics for the current system's memory usage.\n" \
-"-t, -threads <arg>          Start <arg> threads (current max %d)\n" \
-"-h, -help                   Show help and quit.\n"
+	"-F, -file <arg>             Use file <arg> as the comparison file.\n" \
+	"-S, -save                   Save the payload with a sensible suffix.\n" \
+	"-P, -path <arg>             Define an alternate path to save files (default is the current directory).\n" \
+	"-u, -url <arg>              Fetch URL <arg>.\n" \
+	"-X, -stats                  Display statistics for the current system's memory usage.\n" \
+	"-t, -threads <arg>          Start <arg> threads (current max %d)\n" \
+	"-V, -verify <arg>           Verify the payload received\n" \
+	"-h, -help                   Show help and quit.\n"
 
 
 typedef enum {
 	ERX_NONE = 0,
-	ERX_PTHREAD_CREATE,
+	ERX_CURL_CREATE,
 	ERX_TRANSFER_FAILED,
 	ERX_FILESAVE_FAILED,
 } error_t;
@@ -43,7 +44,7 @@ typedef enum {
 
 static const char *errors[] = {
 	[ ERX_NONE            ] = "No errors.",
-	[ ERX_PTHREAD_CREATE  ] = "pthread create() failed.",
+	[ ERX_CURL_CREATE     ] = "curl_easy_init() failed.",
 	[ ERX_TRANSFER_FAILED ] = "File transfer failed.",
 	[ ERX_FILESAVE_FAILED ] = "File save failed.",
 };
@@ -68,9 +69,12 @@ typedef struct req_t {
 	double ttime;
 	unsigned short status;
 	unsigned int tspeedavg;
-	char *url;
 	char header[ 16 ];
 	int fd;
+	char errmsg[ 128 ]; 
+	int cfd;
+	int coffset;
+	int checksum;
 #if 0
 	char *unused;
 	char *stillunused;
@@ -88,10 +92,16 @@ typedef struct req_t {
  */
 typedef struct config_t {
 	char *file;
+	int ufile;
 	int save;
 	char *url;
+	int uurl;
 	char *path;
+	int upath;
+	char *verify;
+	int uverify;
 	int threadcount;
+	int uthreadcount;
 	int stats;
 } config_t;
 
@@ -141,9 +151,23 @@ static size_t size_tracker_callback ( void *c, size_t size, size_t nmemb, void *
 	size_t realsize = size * nmemb;
 	req_t *t = (req_t *)ud;
 	t->size += realsize;
+
 	if ( config.save && ( t->fd > -1 ) ) {
 		write( t->fd, c, realsize ); 
 	}
+
+	if ( t->cfd > -1 ) {
+		// Slow, but copying to buffer is the best we can do...
+		unsigned char buf[ realsize ];
+		memset( buf, 0, realsize );
+		read( t->cfd, buf, realsize );
+		t->coffset += realsize;
+		lseek( t->cfd, t->coffset, SEEK_SET ); 
+		if ( memcmp( c, buf, realsize ) != 0 ) {
+			t->checksum = 0;
+		}
+	}
+
 	return realsize;
 }
 
@@ -159,34 +183,43 @@ void * connection ( void *p ) {
 	CURL *curl = NULL;
 	CURLcode res;
 	req_t *t = (req_t *)p;
-	char fname[ PATH_MAX ] = {0};
+	char fname[ 256 ] = {0};
 
 	// Initialize the header space (TODO: way less is needed)
 	memset( t->header, 0, sizeof( t->header ) );
 
 	// If the user requested the save option, open a file
 	if ( config.save ) {
-		snprintf( fname, PATH_MAX - 1, "%s/%s-%p", config.path, "file", (void *)t );
+		// Shut down if the filename is too long 
+		snprintf( fname, 255, "%s/%s-%p", config.path, "file", (void *)t );
 		//fprintf( stderr, "Attempting to save to %s\n", fname );
 		if ( ( t->fd = open( fname, O_CREAT | O_TRUNC | O_WRONLY, 0644 ) ) == -1 ) {
 			t->error = ERX_FILESAVE_FAILED;
+			snprintf( t->errmsg, sizeof( t->errmsg ) - 1, "%s: %s", errors[ ERX_FILESAVE_FAILED ], strerror( errno ) );
 			//fprintf( stderr, "Error %s\n", strerror( errno ) );
 			return t;
 		}
 	}
 
+	// If we want to check that the bytes match, set checksum here
+	if ( t->cfd > -1 ) {
+		t->checksum = 1;
+	}
+
 	// Initialize a cURL instance
 	if ( !( curl = curl_easy_init() ) ) {
-		t->error = ERX_PTHREAD_CREATE;
+		t->error = ERX_CURL_CREATE;
+		snprintf( t->errmsg, sizeof( t->errmsg ) - 1, "%s: %s", errors[ ERX_CURL_CREATE ], strerror( errno ) );
 		return t;
 	}
 
 	// Set as many options as possible
-	curl_easy_setopt( curl, CURLOPT_URL, t->url );
+	curl_easy_setopt( curl, CURLOPT_URL, config.url );
 	curl_easy_setopt( curl, CURLOPT_HEADERFUNCTION, header_callback );
 	curl_easy_setopt( curl, CURLOPT_HEADERDATA, (void *)t );
 	curl_easy_setopt( curl, CURLOPT_WRITEFUNCTION, size_tracker_callback );
 	curl_easy_setopt( curl, CURLOPT_WRITEDATA, (void *)t );
+	curl_easy_setopt( curl, CURLOPT_ERRORBUFFER, t->errmsg );
 #if 0
 	// Optionally define a different user-agent
 	curl_easy_setopt( curl, CURLOPT_USERAGENT, "My Custom User-Agent" );
@@ -197,7 +230,7 @@ void * connection ( void *p ) {
 
 	// What are the other errors that can be returned...?
 	if ( ( res = curl_easy_perform( curl ) ) != CURLE_OK ) {
-		fprintf( stderr, NAME ": URL transfer failed %s\n", "*" );
+		//fprintf( stderr, NAME ": URL transfer failed %s\n", "*" );
 		t->error = ERX_TRANSFER_FAILED;
 		curl_easy_cleanup( curl );
 		return t;
@@ -210,6 +243,10 @@ void * connection ( void *p ) {
 	// Close any open file
 	if ( config.save ) {
 		close( t->fd );
+	}
+
+	if ( t->cfd > -1 ) {
+		close( t->cfd );
 	}
 	return t;
 }
@@ -235,37 +272,62 @@ int main (int argc, char *argv[]) {
 
 	for ( ++argv; *argv; ) {
 		if ( !strcmp( *argv, "-t" ) || !strcmp( *argv, "-threads" ) )
-			config.threadcount = atoi( *(++argv) );
+			config.threadcount = atoi( *(++argv) ), config.uthreadcount = 1;
 		else if ( !strcmp( *argv, "-u" )  || !strcmp( *argv, "-url" ) )
-			config.url = *(++argv);	
+			config.url = *(++argv), config.uurl = 1;	
 		else if ( !strcmp( *argv, "-S" )  || !strcmp( *argv, "-save" ) )
 			config.save = 1;
 		else if ( !strcmp( *argv, "-F" )  || !strcmp( *argv, "-file" ) )
-			config.file = *(++argv);
+			config.file = *(++argv), config.ufile = 1;
 		else if ( !strcmp( *argv, "-X" )  || !strcmp( *argv, "-stats" ) )
 			config.stats = 1;
 		else if ( !strcmp( *argv, "-P" )  || !strcmp( *argv, "-path" ) )
-			config.path = *(++argv);
+			config.path = *(++argv), config.upath = 1;
+		else if ( !strcmp( *argv, "-V" )  || !strcmp( *argv, "-verify" ) )
+			config.verify = *(++argv), config.uverify = 1;
 		else {
-			fprintf( stderr, "Unknown arg: %s\n", *argv );
+			fprintf( stderr, "%s: Got unknown arg: %s\n", NAME, *argv );
 			return 1;
 		}
 		argv++;
+	}
+
+#if 0
+	// Check arguments from here...
+	if ( config.uthreadcount && config.threadcount < 1 ) {
+		fprintf( stderr, "-threads flag specified, but got no argument.\n" );	
+		return 1;
+	}
+		
+	if ( config.uurl && !config.url ) {
+		fprintf( stderr, "-url flag specified, but got no argument.\n" );	
+		return 1;
+	}
+		
+	if ( config.ufile && !config.file ) {
+		fprintf( stderr, "-file flag specified, but got no argument.\n" );	
+		return 1;
+	}
+		
+	if ( config.upath && !config.path ) {
+		fprintf( stderr, "-path flag specified, but got no argument.\n" );	
+		return 1;
+	}
+		
+	if ( config.uverify && !config.verify ) {
+		fprintf( stderr, "-verify flag specified, but got no argument.\n" );	
+		return 1;
 	}
 
 	if ( config.threadcount < 1 || config.threadcount > MAX_THREADCOUNT ) {
 		fprintf( stderr, NAME ": Invalid -threadcount value => %d\n", config.threadcount );
 		return 1;
 	}
+#endif
 
 	if ( curl_global_init( CURL_GLOBAL_ALL ) != 0 ) {
 		fprintf( stderr, NAME ": Global init failed %s\n", "*" );
 		return 1;
-	}
-
-	if ( config.stats ) {
-		const char *fmt = "Test suite will use: %ld kb of memory\n";
-		fprintf( stdout, fmt, ( sizeof( req_t ) * 100000 ) / 1024 );
 	}
 
 	if ( strlen( config.path ) > 2 && config.path[0] != '.' && config.path[1] != '.' ) {
@@ -283,13 +345,19 @@ int main (int argc, char *argv[]) {
 	req_t *reqs[ config.threadcount ];
 	memset( threads, 0, sizeof( req_t * ) * config.threadcount );
 
+
 	// Add a timer. Pretty rare you won't want this...
 	struct timespec tstart, estart;
 	memset( &tstart, 0, sizeof( struct timespec ) );
 	clock_gettime( CLOCK_REALTIME, &tstart );
 
 	// Making requests to 
-	fprintf( stdout, "Making requests to %s\n", config.url );
+	if ( config.stats ) {
+		// TODO: Need to add the thread usage space to this...
+		const char *fmt = "Test suite will use: %ld kb of memory\n";
+		fprintf( stdout, "Making requests to [%s]\n", config.url );
+		fprintf( stdout, fmt, ( sizeof( req_t ) * 100000 ) / 1024 );
+	}
 
 	// Allocate all the structures ahead of time
 	for ( int i = 0; i < config.threadcount; i++ ) {
@@ -300,14 +368,32 @@ int main (int argc, char *argv[]) {
 	// Make all of the requests
 	for ( int i = 0; i < config.threadcount; i++ ) {
 		req_t *t = reqs[ i ];
-		t->url = config.url;
 		t->size = 0;
 		t->fd = -1;
 		t->status = 999;
+		t->cfd = -1;
+		t->checksum = -1;
+		t->coffset = 0;
+#if 0
+		pthread_attr_t tattr = {0};
+		pthread_attr_init( &tattr )	
+#endif
+
+		// Try opening the comparison file here
+		if ( config.verify ) {
+			// TODO: Let me know the file is open in verbose mode at least once...
+			if ( ( t->cfd = open( config.verify, O_RDONLY ) ) == -1 ) {
+				fprintf( stderr, "verification file inaccessible: %s\n", strerror( errno ) );
+				return 1;
+			}
+		}
 
 		if ( pthread_create( &threads[ i ], NULL, connection, t ) != 0 ) {
 			fprintf( stderr, "pthread_create unsuccessful: %s\n", strerror( errno ) );
-			return 1;
+			// We've hit a limit.  I suggest stopping, but you'd have to reap everything...
+			//return 1;
+			// could always just exit and let the OS deal with it...
+			exit( 1 );
 		}
 
 		t->threadid = threads[ i ];
@@ -327,16 +413,45 @@ int main (int argc, char *argv[]) {
 
 	// Print this
 	fprintf( stdout, "Time elapsed: ~%dm%ds\n", elapsed / 60, elapsed % 60 );
-			
+	
+	// Get the fastest and slowest requests and average time of requests 		
+	int ftime = (double)INT_MAX, stime = 0; 
+	int ccount = 0; 
+	double avgtime = 0.0, total = 0.0;
+
+	for ( int i = 0; i < config.threadcount; i++ ) {
+		req_t *t = reqs[ i ];
+		if ( !t->error ) {
+			// Add to the total and increase completed client count
+			total += t->ttime, ccount ++;
+		
+			// Check for the fastest	
+			if ( t->ttime < ftime ) {
+				ftime = t->ttime;	
+			}
+
+			// Check for the slowest 
+			if ( t->ttime > stime ) {
+				stime = t->ttime;	
+			}
+		}
+	}
+
+	// Print this
+	fprintf( stdout, "%d/%d requests completed\n", ccount, config.threadcount );
+	//fprintf( stdout, "Average time to complete: ~%dm%0.2fs\n", ( avgtime / ccount ) / 60, (double)(( avgtime / ccount ) % 60)  );
+	fprintf( stdout, "Fastest request: ~%dm%ds\n", ftime / 60, ftime % 60 );
+	fprintf( stdout, "Slowest request: ~%dm%ds\n", stime / 60, stime % 60 );
 
 	// Give a status report on all of them
 	for ( int i = 0; i < config.threadcount; i++ ) {
 		req_t *t = reqs[ i ];
 		if ( !t->error ) {
-			fprintf( stdout, LOGFMT, i, (void *)t, t->ttime, t->size, t->status, t->url );
+			fprintf( stdout, LOGFMT, i, (void *)t, t->ttime, t->size, t->status, 
+				( t->checksum == -1 ) ? "-" : ( ( t->checksum ) ? "S" : "F"  ) );
 		}
 		else {
-			fprintf( stdout, "REQ %4d = Error: %s\n", i /*, t->threadid*/, errors[ t->error ] );
+			fprintf( stdout, "REQ %4d (%p) = Error: %s\n", i, (void *)t, t->errmsg );
 		}
 		free( reqs[ i ] );
 	}
