@@ -16,6 +16,8 @@
 #include <unistd.h>
 #include <sys/stat.h>
 #include <curl/curl.h>
+#include <sys/resource.h>
+#include <sys/mman.h>
 
 #define NAME "req"
 
@@ -31,6 +33,8 @@
 	"-X, -stats                  Display statistics for the current system's memory usage.\n" \
 	"-t, -threads <arg>          Start <arg> threads (current max %d)\n" \
 	"-V, -verify <arg>           Verify the payload received\n" \
+	"-K, -maxstacksize <arg>     Specify the maximum stack size\n" \
+	"-O, -maxopenfiles <arg>     Specify the maximum open file count\n" \
 	"-h, -help                   Show help and quit.\n"
 
 
@@ -75,6 +79,8 @@ typedef struct req_t {
 	int cfd;
 	int coffset;
 	int checksum;
+	unsigned char *cmap;
+	ssize_t cmaplen;
 #if 0
 	char *unused;
 	char *stillunused;
@@ -103,6 +109,8 @@ typedef struct config_t {
 	int threadcount;
 	int uthreadcount;
 	int stats;
+	long stacksize;
+	long openfiles;
 } config_t;
 
 config_t config = {0};
@@ -155,7 +163,7 @@ static size_t size_tracker_callback ( void *c, size_t size, size_t nmemb, void *
 	if ( config.save && ( t->fd > -1 ) ) {
 		write( t->fd, c, realsize ); 
 	}
-
+#if 0
 	if ( t->cfd > -1 ) {
 		// Slow, but copying to buffer is the best we can do...
 		unsigned char buf[ realsize ];
@@ -166,6 +174,14 @@ static size_t size_tracker_callback ( void *c, size_t size, size_t nmemb, void *
 		if ( memcmp( c, buf, realsize ) != 0 ) {
 			t->checksum = 0;
 		}
+	}
+#endif
+	if ( t->cmap && t->cmaplen >= realsize ) {
+		if ( memcmp( c, t->cmap, realsize ) != 0 ) {
+			t->checksum = 0;
+		}
+		t->cmap += realsize;
+		t->cmaplen -= realsize;
 	}
 
 	return realsize;
@@ -201,10 +217,16 @@ void * connection ( void *p ) {
 		}
 	}
 
+#if 0
 	// If we want to check that the bytes match, set checksum here
 	if ( t->cfd > -1 ) {
 		t->checksum = 1;
 	}
+#else
+	if ( t->cmap ) {
+		t->checksum = 1;
+	}
+#endif
 
 	// Initialize a cURL instance
 	if ( !( curl = curl_easy_init() ) ) {
@@ -245,9 +267,11 @@ void * connection ( void *p ) {
 		close( t->fd );
 	}
 
+#if 0
 	if ( t->cfd > -1 ) {
 		close( t->cfd );
 	}
+#endif
 	return t;
 }
 
@@ -260,6 +284,11 @@ void * connection ( void *p ) {
  *
  */
 int main (int argc, char *argv[]) {
+
+	// Defining a few necessary things at the top
+	const unsigned char *cmap = NULL; 
+	unsigned int cmaplen = 0;
+	int cmapfd = -1;
 
 	if ( argc < 2 ) {
 		fprintf( stderr, "Usage: %s\n", *argv );
@@ -285,6 +314,10 @@ int main (int argc, char *argv[]) {
 			config.path = *(++argv), config.upath = 1;
 		else if ( !strcmp( *argv, "-V" )  || !strcmp( *argv, "-verify" ) )
 			config.verify = *(++argv), config.uverify = 1;
+		else if ( !strcmp( *argv, "-K" )  || !strcmp( *argv, "-maxstacksize" ) )
+			config.stacksize = atol( *(++argv) );
+		else if ( !strcmp( *argv, "-O" )  || !strcmp( *argv, "-openfiles" ) )
+			config.openfiles = atol( *(++argv) );
 		else {
 			fprintf( stderr, "%s: Got unknown arg: %s\n", NAME, *argv );
 			return 1;
@@ -325,14 +358,43 @@ int main (int argc, char *argv[]) {
 	}
 #endif
 
+	if ( config.stacksize != 0 ) {
+		struct rlimit r = {0};
+		getrlimit( RLIMIT_STACK, &r );
+		fprintf( stderr, "Stack size max of current process is: %lu\n", r.rlim_cur );
+		if ( config.stacksize < 0 || config.stacksize > r.rlim_max ) {
+			fprintf( stderr, "Specified maximum stack size is invalid: %ld\n", config.stacksize );
+			return 1;
+		}
+		r.rlim_cur = (unsigned long)config.stacksize;
+		if ( setrlimit( RLIMIT_STACK, &r ) == -1 ) {
+			fprintf( stderr, "Error setting maximum stack size: %s\n", strerror( errno ) );
+			return 1;
+		}
+	}
+
+	if ( config.openfiles != 0 ) {
+		struct rlimit r = {0};
+		getrlimit( RLIMIT_NOFILE, &r );
+		fprintf( stderr, "Max. open files of current process is: %lu\n", r.rlim_cur );
+		if ( config.openfiles < 0 || config.openfiles > r.rlim_max ) {
+			fprintf( stderr, "Specified maximum open file count is invalid: %ld > %lu\n", config.openfiles, r.rlim_max );
+			return 1;
+		}
+		r.rlim_cur = (unsigned long)config.openfiles;
+		if ( config.openfiles > r.rlim_cur && setrlimit( RLIMIT_NOFILE, &r ) == -1 ) {
+			fprintf( stderr, "Error increasing open files limit: %s\n", strerror( errno ) );
+			return 1;
+		}
+	}
+
 	if ( curl_global_init( CURL_GLOBAL_ALL ) != 0 ) {
 		fprintf( stderr, NAME ": Global init failed %s\n", "*" );
 		return 1;
 	}
 
 	if ( strlen( config.path ) > 2 && config.path[0] != '.' && config.path[1] != '.' ) {
-		struct stat sb;
-		memset( &sb, 0, sizeof( struct stat ) );
+		struct stat sb = {0};
 		if ( stat( config.path, &sb ) == -1 && mkdir( config.path, 0755 ) == -1 ) {
 			fprintf( stderr, NAME ": Directory %s inaccessible...\n", config.path );
 			return 1;
@@ -365,6 +427,33 @@ int main (int argc, char *argv[]) {
 		memset( reqs[ i ], 0, sizeof( req_t ) );
 	}	
 
+
+	// If we requested a verification file, use mmap and load it once
+	if ( config.verify ) {	
+		struct stat sb = {0};
+
+		if ( stat( config.verify, &sb ) == -1 ) {
+			fprintf( stderr, NAME ": Directory %s inaccessible...\n", config.path );
+			return 1;
+		}
+
+		if ( ( cmaplen = sb.st_size ) == 0 ) {
+			fprintf( stderr, NAME ": Size of verification file is zero-length...\n" );
+			return 1;
+		}
+
+		if ( ( cmapfd = open( config.verify, O_RDONLY ) ) == -1 ) {
+			fprintf( stderr, NAME ": Error opening verification file: %s: %s...\n", 
+				config.verify, strerror( errno ) );
+			return 1;
+		}
+
+		if ( ( cmap = mmap( 0, sb.st_size, PROT_READ, MAP_PRIVATE, cmapfd, 0 ) ) == MAP_FAILED ) {
+			fprintf( stderr, "Error mapping verification file: %s\n", strerror( errno ) );
+			return 1;
+		}
+	}
+
 	// Make all of the requests
 	for ( int i = 0; i < config.threadcount; i++ ) {
 		req_t *t = reqs[ i ];
@@ -374,10 +463,11 @@ int main (int argc, char *argv[]) {
 		t->cfd = -1;
 		t->checksum = -1;
 		t->coffset = 0;
+		t->cmap = (unsigned char *)cmap;
+		t->cmaplen = cmaplen;
 #if 0
 		pthread_attr_t tattr = {0};
 		pthread_attr_init( &tattr )	
-#endif
 
 		// Try opening the comparison file here
 		if ( config.verify ) {
@@ -387,6 +477,7 @@ int main (int argc, char *argv[]) {
 				return 1;
 			}
 		}
+#endif
 
 		if ( pthread_create( &threads[ i ], NULL, connection, t ) != 0 ) {
 			fprintf( stderr, "pthread_create unsuccessful: %s\n", strerror( errno ) );
@@ -405,6 +496,12 @@ int main (int argc, char *argv[]) {
 			fprintf( stderr, "pthread_join unsuccessful: %s\n", strerror( errno ) );
 			return 1;
 		}
+	}
+
+	// Unmap the block if we asked for verification
+	if ( cmap ) {
+		munmap( (void *)cmap, cmaplen );
+		close( cmapfd );
 	}
 
 	// Mark the end
