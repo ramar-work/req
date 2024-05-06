@@ -242,6 +242,17 @@ void * connection ( void *p ) {
 	curl_easy_setopt( curl, CURLOPT_WRITEFUNCTION, size_tracker_callback );
 	curl_easy_setopt( curl, CURLOPT_WRITEDATA, (void *)t );
 	curl_easy_setopt( curl, CURLOPT_ERRORBUFFER, t->errmsg );
+
+	// Explicitly close connections
+	curl_easy_setopt( curl, CURLOPT_FORBID_REUSE, 1 );
+
+	// Force a new connection (these seem similar...)
+	curl_easy_setopt( curl, CURLOPT_FRESH_CONNECT, 1 );
+
+	// DNS magic... (this might solve the resolver problem)
+	// https://curl.se/libcurl/c/CURLOPT_RESOLVE.html
+	// curl_easy_setopt( curl, CURLOPT_RESOLVE, ...? );
+
 #if 0
 	// Optionally define a different user-agent
 	curl_easy_setopt( curl, CURLOPT_USERAGENT, "My Custom User-Agent" );
@@ -362,13 +373,13 @@ int main (int argc, char *argv[]) {
 		struct rlimit r = {0};
 		getrlimit( RLIMIT_STACK, &r );
 		fprintf( stderr, "Stack size max of current process is: %lu\n", r.rlim_cur );
-		if ( config.stacksize < 0 || config.stacksize > r.rlim_max ) {
-			fprintf( stderr, "Specified maximum stack size is invalid: %ld\n", config.stacksize );
+		if ( config.stacksize < 0 ) {
+			fprintf( stderr, NAME ": Specified maximum stack size is invalid: %ld\n", config.stacksize );
 			return 1;
 		}
 		r.rlim_cur = (unsigned long)config.stacksize;
 		if ( setrlimit( RLIMIT_STACK, &r ) == -1 ) {
-			fprintf( stderr, "Error setting maximum stack size: %s\n", strerror( errno ) );
+			fprintf( stderr, NAME ": Error setting maximum stack size: %s\n", strerror( errno ) );
 			return 1;
 		}
 	}
@@ -377,13 +388,13 @@ int main (int argc, char *argv[]) {
 		struct rlimit r = {0};
 		getrlimit( RLIMIT_NOFILE, &r );
 		fprintf( stderr, "Max. open files of current process is: %lu\n", r.rlim_cur );
-		if ( config.openfiles < 0 || config.openfiles > r.rlim_max ) {
-			fprintf( stderr, "Specified maximum open file count is invalid: %ld > %lu\n", config.openfiles, r.rlim_max );
+		if ( config.openfiles < 0 ) {
+			fprintf( stderr, NAME ": Specified maximum open file count is invalid: %ld > %lu\n", config.openfiles, r.rlim_max );
 			return 1;
 		}
 		r.rlim_cur = (unsigned long)config.openfiles;
 		if ( config.openfiles > r.rlim_cur && setrlimit( RLIMIT_NOFILE, &r ) == -1 ) {
-			fprintf( stderr, "Error increasing open files limit: %s\n", strerror( errno ) );
+			fprintf( stderr, NAME ": Error increasing open files limit: %s\n", strerror( errno ) );
 			return 1;
 		}
 	}
